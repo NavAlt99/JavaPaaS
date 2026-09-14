@@ -4,3 +4,5 @@ paas-controller/bin/
 paas-controller/paas-controller
 paas-controller/controller
 .env
+sample-app/target/
+sample-app/classes/

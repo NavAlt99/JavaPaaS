@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -12,18 +13,23 @@ type Server struct {
 	resurrector  *Resurrector
 	store        AffinityStore
 	nodeRegistry *NodeRegistry
+	dbaas        *DBaaSManager
 	authToken    string
 	mux          *http.ServeMux
 }
 
-func NewServer(resurrector *Resurrector, store AffinityStore, nodeRegistry *NodeRegistry, authToken string) *Server {
+func NewServer(resurrector *Resurrector, store AffinityStore, nodeRegistry *NodeRegistry, dbaas *DBaaSManager, authToken string) *Server {
 	if nodeRegistry == nil {
 		nodeRegistry = NewNodeRegistry()
+	}
+	if dbaas == nil {
+		dbaas = NewDBaaSManager(nil, "127.0.0.1", 5432)
 	}
 	s := &Server{
 		resurrector:  resurrector,
 		store:        store,
 		nodeRegistry: nodeRegistry,
+		dbaas:        dbaas,
 		authToken:    authToken,
 		mux:          http.NewServeMux(),
 	}
@@ -36,10 +42,17 @@ func NewServer(resurrector *Resurrector, store AffinityStore, nodeRegistry *Node
 	s.mux.HandleFunc("GET /v1/tenants/{id}", s.handleGetTenant)
 	s.mux.HandleFunc("PUT /v1/tenants/{id}", s.handleUpdateTenant)
 	s.mux.HandleFunc("PUT /v1/tenants/{id}/resize", s.handleResizeTenant)
-	s.mux.HandleFunc("PUT /v1/tenants/{id}/tier", s.handleResizeTenant)
+	s.mux.HandleFunc("POST /v1/tenants/{id}/start", s.handleStartTenant)
+	s.mux.HandleFunc("POST /v1/tenants/{id}/stop", s.handleStopTenant)
 	s.mux.HandleFunc("DELETE /v1/tenants/{id}", s.handleDeleteTenant)
 	s.mux.HandleFunc("POST /v1/nodes", s.handleRegisterNode)
 	s.mux.HandleFunc("GET /v1/nodes", s.handleListNodes)
+	s.mux.HandleFunc("POST /v1/databases", s.handleProvisionDatabase)
+	s.mux.HandleFunc("GET /v1/databases", s.handleListDatabases)
+	s.mux.HandleFunc("GET /v1/databases/{id}", s.handleGetDatabase)
+	s.mux.HandleFunc("DELETE /v1/databases/{id}", s.handleDeprovisionDatabase)
+	s.mux.HandleFunc("GET /v1/discovery", s.handleListDiscovery)
+	s.mux.HandleFunc("GET /v1/discovery/{id}", s.handleGetDiscovery)
 
 	return s
 }
@@ -76,6 +89,16 @@ func (s *Server) writeError(w http.ResponseWriter, statusCode int, msg string) {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Enable CORS for web frontends & developer dashboards
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-JavaPaaS-Token")
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	if r.URL.Path != "/health" && r.URL.Path != "/metrics" {
 		if err := s.checkAuth(r); err != nil {
 			s.writeError(w, http.StatusUnauthorized, err.Error())
@@ -132,6 +155,18 @@ func (s *Server) handleRegisterTenant(w http.ResponseWriter, r *http.Request) {
 		ExtraArgs:       req.ExtraArgs,
 		HealthCheckPath: req.HealthCheckPath,
 		HealthCheckPort: req.HealthCheckPort,
+		Database:        req.Database,
+	}
+
+	// Automatic DBaaS provisioning if requested
+	if req.AddonPostgres || req.Database == "postgres" {
+		injectedArgs, dbInfo, err := s.dbaas.InjectDatabaseArgs(req.TenantID, req.ExtraArgs)
+		if err != nil {
+			s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("database provisioning failed: %v", err))
+			return
+		}
+		spec.ExtraArgs = injectedArgs
+		spec.Database = dbInfo.Database
 	}
 
 	if err := s.store.Set(req.TenantID, spec); err != nil {
@@ -226,11 +261,47 @@ func (s *Server) handleResizeTenant(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleDeleteTenant(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleStartTenant(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.PathValue("id")
 	if _, ok := s.store.Get(tenantID); !ok {
 		s.writeError(w, http.StatusNotFound, fmt.Sprintf("tenant %s not found", tenantID))
 		return
+	}
+
+	result := s.resurrector.StartTenant(tenantID)
+	if result.Success {
+		s.writeJSON(w, http.StatusOK, result)
+	} else {
+		s.writeJSON(w, http.StatusInternalServerError, result)
+	}
+}
+
+func (s *Server) handleStopTenant(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	if err := s.resurrector.StopTenant(tenantID); err != nil {
+		s.writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]string{
+		"tenant_id": tenantID,
+		"status":    "stopped",
+	})
+}
+
+func (s *Server) handleDeleteTenant(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	spec, ok := s.store.Get(tenantID)
+	if !ok {
+		s.writeError(w, http.StatusNotFound, fmt.Sprintf("tenant %s not found", tenantID))
+		return
+	}
+
+	// Attempt to stop the tenant on the daemon before deleting spec
+	_ = s.resurrector.StopTenant(tenantID)
+
+	// Clean up managed DBaaS database if one was provisioned
+	if spec.Database != "" {
+		_ = s.dbaas.Deprovision(tenantID)
 	}
 
 	if err := s.store.Delete(tenantID); err != nil {
@@ -241,6 +312,57 @@ func (s *Server) handleDeleteTenant(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]string{
 		"tenant_id": tenantID,
 		"status":    "deleted",
+	})
+}
+
+func (s *Server) handleProvisionDatabase(w http.ResponseWriter, r *http.Request) {
+	var req DatabaseProvisionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if strings.TrimSpace(req.TenantID) == "" {
+		s.writeError(w, http.StatusBadRequest, "tenant_id is required")
+		return
+	}
+
+	info, err := s.dbaas.Provision(req.TenantID)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	s.writeJSON(w, http.StatusCreated, info)
+}
+
+func (s *Server) handleListDatabases(w http.ResponseWriter, r *http.Request) {
+	dbs := s.dbaas.List()
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"databases": dbs,
+		"count":     len(dbs),
+	})
+}
+
+func (s *Server) handleGetDatabase(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	info, ok := s.dbaas.Get(tenantID)
+	if !ok {
+		s.writeError(w, http.StatusNotFound, fmt.Sprintf("no database found for tenant %s", tenantID))
+		return
+	}
+	s.writeJSON(w, http.StatusOK, info)
+}
+
+func (s *Server) handleDeprovisionDatabase(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	if err := s.dbaas.Deprovision(tenantID); err != nil {
+		s.writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]string{
+		"tenant_id": tenantID,
+		"status":    "deprovisioned",
 	})
 }
 
@@ -294,4 +416,54 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# HELP javapaas_controller_last_recovery_latency_ms Latency of most recent recovery in milliseconds\n")
 	fmt.Fprintf(w, "# TYPE javapaas_controller_last_recovery_latency_ms gauge\n")
 	fmt.Fprintf(w, "javapaas_controller_last_recovery_latency_ms %d\n", lastLatency)
+}
+
+func (s *Server) resolveTenantEndpoint(tenantID string, spec TenantSpec) ServiceEndpoint {
+	host := "127.0.0.1"
+	if daemonURL, ok := s.nodeRegistry.Get(spec.NodeID); ok && daemonURL != "" {
+		if u, err := url.Parse(daemonURL); err == nil && u.Hostname() != "" {
+			host = u.Hostname()
+		}
+	}
+
+	port := spec.HealthCheckPort
+	serviceURL := fmt.Sprintf("http://%s:%d", host, port)
+	status := "active"
+	if rStatus, ok := s.resurrector.inFlight.Load(tenantID); ok && rStatus.(bool) {
+		status = "recovering"
+	}
+
+	return ServiceEndpoint{
+		TenantID:   tenantID,
+		NodeID:     spec.NodeID,
+		Host:       host,
+		Port:       port,
+		URL:        serviceURL,
+		HealthPath: spec.HealthCheckPath,
+		Tier:       spec.Tier,
+		Status:     status,
+	}
+}
+
+func (s *Server) handleListDiscovery(w http.ResponseWriter, r *http.Request) {
+	tenants := s.store.GetAll()
+	endpoints := make([]ServiceEndpoint, 0, len(tenants))
+	for tid, spec := range tenants {
+		endpoints = append(endpoints, s.resolveTenantEndpoint(tid, spec))
+	}
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"endpoints": endpoints,
+		"count":     len(endpoints),
+	})
+}
+
+func (s *Server) handleGetDiscovery(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	spec, ok := s.store.Get(tenantID)
+	if !ok {
+		s.writeError(w, http.StatusNotFound, fmt.Sprintf("tenant %s not found in discovery catalog", tenantID))
+		return
+	}
+	endpoint := s.resolveTenantEndpoint(tenantID, spec)
+	s.writeJSON(w, http.StatusOK, endpoint)
 }

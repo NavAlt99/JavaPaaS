@@ -12,7 +12,7 @@ func TestServerHealthAndAuth(t *testing.T) {
 	store := NewNodeAffinityStore("")
 	nodes := NewNodeRegistry()
 	resurrector := NewResurrector("http://localhost:9100", "test-secret", store, nodes)
-	server := NewServer(resurrector, store, nodes, "test-secret")
+	server := NewServer(resurrector, store, nodes, nil, "test-secret")
 
 	// /health should be accessible without auth
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
@@ -55,7 +55,7 @@ func TestServerTenantCRUD(t *testing.T) {
 	store := NewNodeAffinityStore("")
 	nodes := NewNodeRegistry()
 	resurrector := NewResurrector("http://localhost:9100", "", store, nodes)
-	server := NewServer(resurrector, store, nodes, "")
+	server := NewServer(resurrector, store, nodes, nil, "")
 
 	// 1. Create tenant
 	regReq := TenantRegistrationRequest{
@@ -133,5 +133,70 @@ func TestServerTenantCRUD(t *testing.T) {
 	server.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 Not Found, got %d", w.Code)
+	}
+}
+
+func TestServerServiceDiscovery(t *testing.T) {
+	store := NewNodeAffinityStore("")
+	nodes := NewNodeRegistry()
+	nodes.Register("node-cluster-1", "http://192.168.1.50:9100")
+
+	resurrector := NewResurrector("http://localhost:9100", "", store, nodes)
+	dbaas := NewDBaaSManager(nil, "localhost", 5432)
+	server := NewServer(resurrector, store, nodes, dbaas, "")
+
+	// Register tenant with health check port
+	spec := TenantSpec{
+		NodeID:          "node-cluster-1",
+		JavaVersion:     "21",
+		Tier:            "gold",
+		JarPath:         "/opt/apps/payment.jar",
+		HealthCheckPort: 8089,
+		HealthCheckPath: "/health",
+	}
+	_ = store.Set("payment-service", spec)
+
+	// Query /v1/discovery
+	req := httptest.NewRequest(http.MethodGet, "/v1/discovery", nil)
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for /v1/discovery, got %d", w.Code)
+	}
+
+	var discResp struct {
+		Endpoints []ServiceEndpoint `json:"endpoints"`
+		Count     int               `json:"count"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&discResp); err != nil {
+		t.Fatalf("failed to decode discovery response: %v", err)
+	}
+	if discResp.Count != 1 || len(discResp.Endpoints) != 1 {
+		t.Fatalf("expected 1 endpoint in discovery catalog, got %d", discResp.Count)
+	}
+
+	ep := discResp.Endpoints[0]
+	if ep.TenantID != "payment-service" || ep.Port != 8089 || ep.Host != "192.168.1.50" {
+		t.Errorf("unexpected endpoint details: %+v", ep)
+	}
+	if ep.URL != "http://192.168.1.50:8089" {
+		t.Errorf("unexpected service url: %s", ep.URL)
+	}
+
+	// Query single tenant /v1/discovery/payment-service
+	req = httptest.NewRequest(http.MethodGet, "/v1/discovery/payment-service", nil)
+	w = httptest.NewRecorder()
+	server.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for /v1/discovery/payment-service, got %d", w.Code)
+	}
+
+	var singleEp ServiceEndpoint
+	if err := json.NewDecoder(w.Body).Decode(&singleEp); err != nil {
+		t.Fatalf("failed to decode single discovery: %v", err)
+	}
+	if singleEp.TenantID != "payment-service" || singleEp.Status != "active" {
+		t.Errorf("unexpected single endpoint response: %+v", singleEp)
 	}
 }

@@ -281,7 +281,8 @@ impl HealthWatchdog {
                     ) {
                         Ok(nix::sys::wait::WaitStatus::Exited(pid, code)) => {
                             let mut tenants = tenants_map2.lock().await;
-                            let tenant_id = Self::find_tenant_by_pid(&tenants, pid.as_raw() as u32);
+                            let dead_pid = pid.as_raw() as u32;
+                            let tenant_id = Self::find_tenant_by_pid(&tenants, dead_pid);
                             let tid = match tenant_id {
                                 Some(ref t) => t.clone(),
                                 None => continue,
@@ -293,18 +294,28 @@ impl HealthWatchdog {
                             match current_status {
                                 Some(TenantStatus::Stopping) => {
                                     info!("Tenant {tid} stopped cleanly via API (PID {pid})");
-                                    tenants.remove(&tid);
-                                    let _ = cgroup_mgr2.remove_tenant(&tier, &tid);
+                                    if let Some(t) = tenants.get(&tid) {
+                                        if t.pid == dead_pid {
+                                            tenants.remove(&tid);
+                                            let _ = cgroup_mgr2.remove_tenant(&tier, &tid);
+                                        }
+                                    }
                                 }
                                 Some(TenantStatus::Recovering) => {
                                     info!("Tenant {tid} exited while already in recovery (PID {pid})");
-                                    tenants.remove(&tid);
-                                    let _ = cgroup_mgr2.remove_tenant(&tier, &tid);
+                                    if let Some(t) = tenants.get(&tid) {
+                                        if t.pid == dead_pid {
+                                            tenants.remove(&tid);
+                                            let _ = cgroup_mgr2.remove_tenant(&tier, &tid);
+                                        }
+                                    }
                                 }
                                 Some(TenantStatus::Running) => {
                                     warn!("Tenant {tid} exited with code {code} (PID {pid})");
                                     if let Some(t) = tenants.get_mut(&tid) {
-                                        t.status = TenantStatus::Exited;
+                                        if t.pid == dead_pid {
+                                            t.status = TenantStatus::Exited;
+                                        }
                                     }
                                     drop(tenants);
 
@@ -319,17 +330,26 @@ impl HealthWatchdog {
                                     Self::report_crash(&controller_url2, &auth_token2, &event).await;
 
                                     let mut tenants = tenants_map2.lock().await;
-                                    tenants.remove(&tid);
-                                    let _ = cgroup_mgr2.remove_tenant(&tier, &tid);
+                                    if let Some(t) = tenants.get(&tid) {
+                                        if t.pid == dead_pid {
+                                            tenants.remove(&tid);
+                                            let _ = cgroup_mgr2.remove_tenant(&tier, &tid);
+                                        }
+                                    }
                                 }
                                 _ => {
-                                    tenants.remove(&tid);
+                                    if let Some(t) = tenants.get(&tid) {
+                                        if t.pid == dead_pid {
+                                            tenants.remove(&tid);
+                                        }
+                                    }
                                 }
                             }
                         }
                         Ok(nix::sys::wait::WaitStatus::Signaled(pid, sig, _)) => {
                             let mut tenants = tenants_map2.lock().await;
-                            let tenant_id = Self::find_tenant_by_pid(&tenants, pid.as_raw() as u32);
+                            let dead_pid = pid.as_raw() as u32;
+                            let tenant_id = Self::find_tenant_by_pid(&tenants, dead_pid);
                             let tid = match tenant_id {
                                 Some(ref t) => t.clone(),
                                 None => continue,
@@ -341,18 +361,28 @@ impl HealthWatchdog {
                             match current_status {
                                 Some(TenantStatus::Stopping) => {
                                     info!("Tenant {tid} killed during intentional stop (PID {pid})");
-                                    tenants.remove(&tid);
-                                    let _ = cgroup_mgr2.remove_tenant(&tier, &tid);
+                                    if let Some(t) = tenants.get(&tid) {
+                                        if t.pid == dead_pid {
+                                            tenants.remove(&tid);
+                                            let _ = cgroup_mgr2.remove_tenant(&tier, &tid);
+                                        }
+                                    }
                                 }
                                 Some(TenantStatus::Recovering) => {
                                     info!("Tenant {tid} killed while already in recovery (PID {pid})");
-                                    tenants.remove(&tid);
-                                    let _ = cgroup_mgr2.remove_tenant(&tier, &tid);
+                                    if let Some(t) = tenants.get(&tid) {
+                                        if t.pid == dead_pid {
+                                            tenants.remove(&tid);
+                                            let _ = cgroup_mgr2.remove_tenant(&tier, &tid);
+                                        }
+                                    }
                                 }
                                 Some(TenantStatus::Running) => {
                                     warn!("Tenant {tid} killed by signal {sig} (PID {pid})");
                                     if let Some(t) = tenants.get_mut(&tid) {
-                                        t.status = TenantStatus::Exited;
+                                        if t.pid == dead_pid {
+                                            t.status = TenantStatus::Exited;
+                                        }
                                     }
                                     drop(tenants);
 
@@ -367,11 +397,19 @@ impl HealthWatchdog {
                                     Self::report_crash(&controller_url2, &auth_token2, &event).await;
 
                                     let mut tenants = tenants_map2.lock().await;
-                                    tenants.remove(&tid);
-                                    let _ = cgroup_mgr2.remove_tenant(&tier, &tid);
+                                    if let Some(t) = tenants.get(&tid) {
+                                        if t.pid == dead_pid {
+                                            tenants.remove(&tid);
+                                            let _ = cgroup_mgr2.remove_tenant(&tier, &tid);
+                                        }
+                                    }
                                 }
                                 _ => {
-                                    tenants.remove(&tid);
+                                    if let Some(t) = tenants.get(&tid) {
+                                        if t.pid == dead_pid {
+                                            tenants.remove(&tid);
+                                        }
+                                    }
                                 }
                             }
                         }
