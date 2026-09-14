@@ -22,6 +22,7 @@ type TenantSpec struct {
 	ExtraArgs       []string `json:"extra_args"`
 	HealthCheckPath string   `json:"health_check_path,omitempty"`
 	HealthCheckPort int      `json:"health_check_port,omitempty"`
+	Database        string   `json:"database,omitempty"`
 }
 
 func (s *TenantSpec) Validate() error {
@@ -53,6 +54,24 @@ type TenantRegistrationRequest struct {
 	ExtraArgs       []string `json:"extra_args"`
 	HealthCheckPath string   `json:"health_check_path,omitempty"`
 	HealthCheckPort int      `json:"health_check_port,omitempty"`
+	Database        string   `json:"database,omitempty"`
+	AddonPostgres   bool     `json:"addon_postgres,omitempty"`
+}
+
+type DatabaseProvisionRequest struct {
+	TenantID string `json:"tenant_id"`
+}
+
+type DatabaseInfo struct {
+	TenantID  string `json:"tenant_id"`
+	Database  string `json:"database"`
+	Username  string `json:"username"`
+	Password  string `json:"password,omitempty"`
+	Host      string `json:"host"`
+	Port      int    `json:"port"`
+	JdbcURL   string `json:"jdbc_url"`
+	Status    string `json:"status"`
+	CreatedAt string `json:"created_at"`
 }
 
 type TenantResizeRequest struct {

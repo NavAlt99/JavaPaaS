@@ -8,7 +8,7 @@ Reviewed and implemented on 2026-09-14. This document provides the architectural
 
 JavaPaaS combines a low-level Rust daemon ([`javapaas-daemon`](file:///home/naveen/Projects/JavaPaaS/src/main.rs)) managing JVM processes and Linux cgroups v2 with a Go orchestration controller ([`paas-controller`](file:///home/naveen/Projects/JavaPaaS/paas-controller/main.go)) handling automated fault recovery and node affinity.
 
-All 13 identified improvements, security gaps, and hygiene issues have been resolved, verified, and backed by automated unit tests.
+All 15 identified improvements, database capabilities, security gaps, and hygiene issues have been resolved, verified, and backed by automated unit tests.
 
 ### Remediation Matrix
 
@@ -24,9 +24,11 @@ All 13 identified improvements, security gaps, and hygiene issues have been reso
 | **#8** | **Cgroup host checks & tier subtree control missing**<br>Root controllers were unverified and tier directories lacked subtree controls. | Medium | **Resolved** | Added host controller validation; propagated `+cpu +memory +io` through both root and tier cgroups. |
 | **#9** | **Controller lacked graceful shutdown**<br>Immediate `os.Exit(0)` aborted active recovery attempts. | Medium | **Resolved** | Implemented `http.Server.Shutdown(ctx)` with 5-second drain timeout on `SIGINT`/`SIGTERM`. |
 | **#10** | **Services deployed exclusively as root**<br>Controller was unnecessarily granted root privileges. | Medium | **Resolved** | Controller deployed under dedicated unprivileged `javapaas` user with systemd sandboxing. |
-| **#11** | **Testing Gaps**<br>Zero unit or integration tests in Rust and Go codebases. | High | **Resolved** | Implemented 10 Rust unit tests and 7 Go test suites with 100% pass rate. |
+| **#11** | **Testing Gaps**<br>Zero unit or integration tests in Rust and Go codebases. | High | **Resolved** | Implemented 10 Rust unit tests and 10 Go test suites with 100% pass rate. |
 | **#12** | **Repository Hygiene**<br>Untracked `target/` binaries and temporary artifacts. | Low | **Resolved** | Added root `.gitignore` covering `target/`, Go binaries, and `.env`. |
 | **#13** | **Documentation Drift**<br>README listed outdated APIs, missing endpoints, and inaccurate flags. | Low | **Resolved** | README fully updated with architecture diagrams, security flags, and API specs. |
+| **#14** | **Controller state restricted to flat-file storage**<br>Flat JSON file prevented horizontal scaling of multiple controllers. | Medium | **Resolved** | Implemented `PostgresAffinityStore` in Go controller for clustered HA state with ACID guarantees. |
+| **#15** | **Lack of managed database add-on (DBaaS)**<br>Tenants had to configure and manage external databases manually. | Medium | **Resolved** | Implemented `DBaaSManager` and `/v1/databases` suite with auto-provisioning and Spring Boot injection. |
 
 ---
 
@@ -173,6 +175,24 @@ stateDiagram-v2
      - `GET /v1/nodes`: list registered worker nodes.
      - Resurrector routes recovery calls directly to the specific host daemon assigned to the tenant's `NodeID`.
 
+### Phase 4: Built-in Database Support & DBaaS Add-Ons — **Completed (2026-09-14)**
+
+1. **PostgreSQL Storage Backend for PaaS Controller State**:
+   - Implemented [`PostgresAffinityStore`](file:///home/naveen/Projects/JavaPaaS/paas-controller/db_store.go) implementing `AffinityStore` via PostgreSQL with connection pooling (`database/sql` + `github.com/lib/pq`).
+   - Automatically initializes and manages the `javapaas_tenants` ACID schema with atomic upsert operations (`ON CONFLICT (tenant_id) DO UPDATE`).
+   - Configured via `-database-url` CLI flag or `DATABASE_URL` environment variable; automatically falls back to atomic file-based persistence when no database connection is supplied.
+2. **Database-as-a-Service (DBaaS) Add-On Provisioner**:
+   - Implemented [`DBaaSManager`](file:///home/naveen/Projects/JavaPaaS/paas-controller/dbaas.go) providing automated, isolated PostgreSQL database and user provisioning on-demand.
+   - Generates cryptographically secure passwords and sanitizes identifiers (`tenant_<id>_db` and `tenant_<id>_usr`).
+   - **REST API Suite**:
+     - `POST /v1/databases`: provision a dedicated database for a tenant.
+     - `GET /v1/databases`: list all provisioned tenant databases.
+     - `GET /v1/databases/{id}`: retrieve database credentials and JDBC connection string.
+     - `DELETE /v1/databases/{id}`: deprovision database, terminate active connections, and drop database and user roles.
+   - **Automatic Tenant Database Injection**:
+     - When registering a tenant with `"addon_postgres": true` or `"database": "postgres"`, the controller automatically provisions a database and injects standard Spring Boot and Java system properties (`-Dspring.datasource.url=...`, `-Dspring.datasource.username=...`, `-Dspring.datasource.password=...`, `-Djavapaas.db.host=...`) directly into the tenant's JVM arguments.
+     - When a tenant is deleted via `DELETE /v1/tenants/{id}`, its managed DBaaS database is automatically reaped.
+
 ---
 
 ## 6. Verification & Automated Test Summary
@@ -203,18 +223,22 @@ Result: 14 passed; 0 failed; 0 warnings; 0 errors
 --- PASS: TestTenantSpecValidate (0.00s)
 === RUN   TestNodeAffinityStorePersistence
 --- PASS: TestNodeAffinityStorePersistence (0.00s)
+=== RUN   TestDBaaSManagerLifecycle
+--- PASS: TestDBaaSManagerLifecycle (0.00s)
+=== RUN   TestServerDBaaSEndpoints
+--- PASS: TestServerDBaaSEndpoints (0.00s)
 === RUN   TestResurrectorMissingAffinity
 --- PASS: TestResurrectorMissingAffinity (0.00s)
 === RUN   TestResurrectorSuccessfulRecovery
 --- PASS: TestResurrectorSuccessfulRecovery (0.00s)
 === RUN   TestResurrectorHealthProbing
---- PASS: TestResurrectorHealthProbing (2.21s)
+--- PASS: TestResurrectorHealthProbing (2.22s)
 === RUN   TestResurrectorConcurrentDeduplication
 --- PASS: TestResurrectorConcurrentDeduplication (0.00s)
 === RUN   TestServerHealthAndAuth
 --- PASS: TestServerHealthAndAuth (0.00s)
 === RUN   TestServerTenantCRUD
---- PASS: TestServerTenantCRUD (0.00s)
+--- PASS: TestServerTenantCRUD (1.00s)
 
-Result: 8 passed; 0 failed; 0 errors
+Result: 10 passed; 0 failed; 0 errors
 ```

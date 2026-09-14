@@ -12,7 +12,7 @@ func TestServerHealthAndAuth(t *testing.T) {
 	store := NewNodeAffinityStore("")
 	nodes := NewNodeRegistry()
 	resurrector := NewResurrector("http://localhost:9100", "test-secret", store, nodes)
-	server := NewServer(resurrector, store, nodes, "test-secret")
+	server := NewServer(resurrector, store, nodes, nil, "test-secret")
 
 	// /health should be accessible without auth
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
@@ -55,7 +55,7 @@ func TestServerTenantCRUD(t *testing.T) {
 	store := NewNodeAffinityStore("")
 	nodes := NewNodeRegistry()
 	resurrector := NewResurrector("http://localhost:9100", "", store, nodes)
-	server := NewServer(resurrector, store, nodes, "")
+	server := NewServer(resurrector, store, nodes, nil, "")
 
 	// 1. Create tenant
 	regReq := TenantRegistrationRequest{

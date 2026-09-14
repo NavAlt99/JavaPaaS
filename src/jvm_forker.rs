@@ -46,7 +46,15 @@ impl JvmForker {
             return Ok(java_path);
         }
 
-        // 2. Check system PATH
+        // 2. Check JAVA_HOME environment variable
+        if let Ok(java_home) = std::env::var("JAVA_HOME") {
+            let candidate = PathBuf::from(java_home).join("bin").join("java");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+
+        // 3. Check system PATH
         if let Some(path_var) = std::env::var_os("PATH") {
             for dir in std::env::split_paths(&path_var) {
                 let candidate = dir.join("java");
@@ -56,11 +64,12 @@ impl JvmForker {
             }
         }
 
-        // 3. Check well-known fallback paths
+        // 4. Check well-known fallback paths
         let candidates = [
             PathBuf::from("/usr/local/bin/java"),
             PathBuf::from("/usr/bin/java"),
             PathBuf::from("/bin/java"),
+            PathBuf::from("/opt/pycharm-2025.3.3/jbr/bin/java"),
         ];
         for c in &candidates {
             if c.is_file() {
@@ -69,7 +78,7 @@ impl JvmForker {
         }
 
         Err(DaemonError::NotFound(format!(
-            "Java executable not found for version '{version}' (checked /opt/jdk/{version}/bin/java and system PATH)"
+            "Java executable not found for version '{version}' (checked /opt/jdk/{version}/bin/java, JAVA_HOME, PATH, and system paths)"
         )))
     }
 

@@ -53,6 +53,26 @@ flowchart TD
 
 ---
 
+## 🚀 Quickstart & Deployment
+
+For a comprehensive walkthrough of deploying JavaPaaS in both local development and production environments, see the [**Complete Deployment Guide (DEPLOYMENT.md)**](DEPLOYMENT.md).
+
+### 1-Command Automated E2E Test
+Test the full lifecycle (compilation, tenant registration, readiness health probing, live tier resizing, crash induction, and auto-resurrection) with a single command:
+
+```bash
+./scripts/test_sample_e2e.sh
+```
+
+### Build & Run the Sample App Standalone
+```bash
+./sample-app/build.sh
+java -jar sample-app/target/sample-app.jar --port=8085
+curl http://127.0.0.1:8085/health
+```
+
+---
+
 ## 🌟 Key Features
 
 * **Kernel-Native Isolation with cgroups v2:** Creates isolated hierarchical control groups per tier and tenant before process spawn, with strict memory ceilings (`memory.max`), zero-swap enforcement (`memory.swap.max = 0`), and group OOM termination (`memory.oom.group = 1`). Subtree control is propagated through both root and tier levels.
@@ -284,10 +304,31 @@ Optional authentication: pass `Authorization: Bearer <AUTH_TOKEN>` or header `X-
 #### 3. Get Tenant
 * **Endpoint:** `GET /v1/tenants/{tenant_id}`
 
-#### 4. Delete Tenant
+#### 4. Start Tenant
+* **Endpoint:** `POST /v1/tenants/{tenant_id}/start`
+* **Response (200 OK):**
+  ```json
+  {
+    "success": true,
+    "new_pid": 116316,
+    "latency_ms": 149
+  }
+  ```
+
+#### 5. Stop Tenant
+* **Endpoint:** `POST /v1/tenants/{tenant_id}/stop`
+* **Response (200 OK):**
+  ```json
+  {
+    "tenant_id": "tenant-alpha",
+    "status": "stopped"
+  }
+  ```
+
+#### 6. Delete Tenant
 * **Endpoint:** `DELETE /v1/tenants/{tenant_id}`
 
-#### 5. Recover Tenant (Internal)
+#### 7. Recover Tenant (Internal)
 * **Endpoint:** `POST /v1/internal/recover`
 * **Request (sent by Rust Watchdog):**
   ```json
@@ -309,7 +350,7 @@ Optional authentication: pass `Authorization: Bearer <AUTH_TOKEN>` or header `X-
   }
   ```
 
-#### 6. Live Resize Tenant Tier
+#### 8. Live Resize Tenant Tier
 * **Endpoint:** `PUT /v1/tenants/{tenant_id}/resize` or `PUT /v1/tenants/{tenant_id}/tier`
 * **Request:**
   ```json
@@ -318,7 +359,7 @@ Optional authentication: pass `Authorization: Bearer <AUTH_TOKEN>` or header `X-
   }
   ```
 
-#### 7. Cluster Node Registration
+#### 9. Cluster Node Registration
 * **Endpoint:** `POST /v1/nodes`
 * **Request:**
   ```json
@@ -329,10 +370,32 @@ Optional authentication: pass `Authorization: Bearer <AUTH_TOKEN>` or header `X-
   ```
 * **Endpoint:** `GET /v1/nodes` (List cluster worker nodes)
 
-#### 8. Controller Prometheus Metrics
+#### 10. Controller Prometheus Metrics
 * **Endpoint:** `GET /metrics`
 * **Response (200 OK, text/plain):**
   Exposes `javapaas_controller_registered_tenants`, `javapaas_controller_recovery_attempts_total`, and `javapaas_controller_last_recovery_latency_ms`.
+
+#### 11. Managed Database (DBaaS) Endpoints
+* **Provision Database:** `POST /v1/databases`
+  ```json
+  {
+    "tenant_id": "billing-service"
+  }
+  ```
+* **List Databases:** `GET /v1/databases`
+* **Get Database Credentials & JDBC URL:** `GET /v1/databases/{tenant_id}`
+  ```json
+  {
+    "tenant_id": "billing-service",
+    "database": "tenant_billing_service_db",
+    "username": "tenant_billing_service_usr",
+    "jdbc_url": "jdbc:postgresql://127.0.0.1:5432/tenant_billing_service_db?sslmode=disable",
+    "status": "ready"
+  }
+  ```
+* **Deprovision Database:** `DELETE /v1/databases/{tenant_id}`
+* **Auto-Provisioning with Tenant Registration:**
+  Include `"addon_postgres": true` in `POST /v1/tenants` to automatically provision a database and inject Spring Boot `-Dspring.datasource.*` arguments into the JVM!
 
 ---
 

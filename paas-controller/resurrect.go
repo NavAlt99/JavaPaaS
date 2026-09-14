@@ -88,7 +88,9 @@ func (r *Resurrector) probeHealth(daemonURL string, port int, path string) error
 
 func (r *Resurrector) stopTenant(daemonURL string, tenantID string) {
 	stopURL := fmt.Sprintf("%s/stop/%s", daemonURL, tenantID)
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, stopURL, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, stopURL, nil)
 	if err == nil {
 		if r.authToken != "" {
 			req.Header.Set("Authorization", "Bearer "+r.authToken)
@@ -120,6 +122,23 @@ func (r *Resurrector) ResizeTenant(daemonURL string, tenantID string, newTier st
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("daemon returned HTTP %d during resize", resp.StatusCode)
 	}
+	return nil
+}
+
+func (r *Resurrector) StartTenant(tenantID string) RecoveryResult {
+	return r.resurrect(TenantCrashEvent{
+		TenantID: tenantID,
+		Reason:   "manual_start",
+	})
+}
+
+func (r *Resurrector) StopTenant(tenantID string) error {
+	spec, ok := r.store.Get(tenantID)
+	if !ok {
+		return fmt.Errorf("no affinity record for tenant %s", tenantID)
+	}
+	daemonURL := r.resolveDaemonURL(spec.NodeID)
+	r.stopTenant(daemonURL, tenantID)
 	return nil
 }
 

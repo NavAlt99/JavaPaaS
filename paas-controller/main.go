@@ -18,17 +18,42 @@ func main() {
 	}
 
 	defaultAuthToken := os.Getenv("AUTH_TOKEN")
+	defaultDBURL := os.Getenv("DATABASE_URL")
+	defaultDBaaSHost := os.Getenv("DBAAS_HOST")
+	if defaultDBaaSHost == "" {
+		defaultDBaaSHost = "127.0.0.1"
+	}
 
 	listenAddr := flag.String("listen", "127.0.0.1:8080", "Controller HTTP listen address")
 	daemonURL := flag.String("daemon-url", "http://127.0.0.1:9100", "Rust daemon base URL")
 	stateFile := flag.String("state-file", defaultStateFile, "Path to persistent tenant affinity JSON file")
+	databaseURL := flag.String("database-url", defaultDBURL, "PostgreSQL connection string for state store & DBaaS (e.g. postgres://user:pass@localhost:5432/javapaas?sslmode=disable)")
+	dbaasHost := flag.String("dbaas-host", defaultDBaaSHost, "Public hostname/IP for DBaaS JDBC connections")
+	dbaasPort := flag.Int("dbaas-port", 5432, "Public port for DBaaS JDBC connections")
 	authToken := flag.String("auth-token", defaultAuthToken, "Internal bearer auth token")
 	flag.Parse()
 
 	nodeRegistry := NewNodeRegistry()
-	store := NewNodeAffinityStore(*stateFile)
+
+	var store AffinityStore
+	var dbaas *DBaaSManager
+
+	if *databaseURL != "" {
+		pgStore, err := NewPostgresAffinityStore(*databaseURL)
+		if err != nil {
+			log.Fatalf("Failed to initialize PostgreSQL affinity store: %v", err)
+		}
+		store = pgStore
+		dbaas = NewDBaaSManager(pgStore.DB(), *dbaasHost, *dbaasPort)
+		log.Printf("Connected to PostgreSQL backend for state and DBaaS")
+	} else {
+		store = NewNodeAffinityStore(*stateFile)
+		dbaas = NewDBaaSManager(nil, *dbaasHost, *dbaasPort)
+		log.Printf("Using file-based tenant affinity store: %s", *stateFile)
+	}
+
 	resurrector := NewResurrector(*daemonURL, *authToken, store, nodeRegistry)
-	server := NewServer(resurrector, store, nodeRegistry, *authToken)
+	server := NewServer(resurrector, store, nodeRegistry, dbaas, *authToken)
 
 	srv := &http.Server{
 		Addr:    *listenAddr,

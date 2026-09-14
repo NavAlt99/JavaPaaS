@@ -139,6 +139,16 @@ impl CgroupManager {
             warn!("Could not set cpu.max on {:?}: {e}", cpu_file);
         }
 
+        let procs_file = tenant_path.join("cgroup.procs");
+        if !procs_file.exists() {
+            let _ = fs::File::create(&procs_file);
+        }
+
+        let events_file = tenant_path.join("memory.events");
+        if !events_file.exists() {
+            let _ = fs::write(&events_file, "oom_kill 0\n");
+        }
+
         info!(
             "Created tenant cgroup: {} with memory.max={} cpu.max={}",
             tenant_path.display(),
