@@ -397,6 +397,27 @@ Optional authentication: pass `Authorization: Bearer <AUTH_TOKEN>` or header `X-
 * **Auto-Provisioning with Tenant Registration:**
   Include `"addon_postgres": true` in `POST /v1/tenants` to automatically provision a database and inject Spring Boot `-Dspring.datasource.*` arguments into the JVM!
 
+#### 12. Dynamic Service Discovery
+* **List All Endpoints:** `GET /v1/discovery`
+  ```json
+  {
+    "endpoints": [
+      {
+        "tenant_id": "payment-service",
+        "node_id": "node-1",
+        "host": "192.168.1.50",
+        "port": 8089,
+        "url": "http://192.168.1.50:8089",
+        "health_path": "/health",
+        "tier": "gold",
+        "status": "active"
+      }
+    ],
+    "count": 1
+  }
+  ```
+* **Resolve Single Tenant:** `GET /v1/discovery/{tenant_id}`
+
 ---
 
 ## 🧪 Testing

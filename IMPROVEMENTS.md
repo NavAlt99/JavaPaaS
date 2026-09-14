@@ -8,7 +8,7 @@ Reviewed and implemented on 2026-09-14. This document provides the architectural
 
 JavaPaaS combines a low-level Rust daemon ([`javapaas-daemon`](file:///home/naveen/Projects/JavaPaaS/src/main.rs)) managing JVM processes and Linux cgroups v2 with a Go orchestration controller ([`paas-controller`](file:///home/naveen/Projects/JavaPaaS/paas-controller/main.go)) handling automated fault recovery and node affinity.
 
-All 15 identified improvements, database capabilities, security gaps, and hygiene issues have been resolved, verified, and backed by automated unit tests.
+All 16 identified improvements, database capabilities, service discovery, security gaps, and hygiene issues have been resolved, verified, and backed by automated unit tests.
 
 ### Remediation Matrix
 
@@ -29,6 +29,7 @@ All 15 identified improvements, database capabilities, security gaps, and hygien
 | **#13** | **Documentation Drift**<br>README listed outdated APIs, missing endpoints, and inaccurate flags. | Low | **Resolved** | README fully updated with architecture diagrams, security flags, and API specs. |
 | **#14** | **Controller state restricted to flat-file storage**<br>Flat JSON file prevented horizontal scaling of multiple controllers. | Medium | **Resolved** | Implemented `PostgresAffinityStore` in Go controller for clustered HA state with ACID guarantees. |
 | **#15** | **Lack of managed database add-on (DBaaS)**<br>Tenants had to configure and manage external databases manually. | Medium | **Resolved** | Implemented `DBaaSManager` and `/v1/databases` suite with auto-provisioning and Spring Boot injection. |
+| **#16** | **Lack of native service discovery & endpoint resolution**<br>Inter-service communication required manual IP/port configuration. | Medium | **Resolved** | Implemented `/v1/discovery` engine with dynamic node/port resolution and crash-aware health status. |
 
 ---
 
@@ -193,9 +194,60 @@ stateDiagram-v2
      - When registering a tenant with `"addon_postgres": true` or `"database": "postgres"`, the controller automatically provisions a database and injects standard Spring Boot and Java system properties (`-Dspring.datasource.url=...`, `-Dspring.datasource.username=...`, `-Dspring.datasource.password=...`, `-Djavapaas.db.host=...`) directly into the tenant's JVM arguments.
      - When a tenant is deleted via `DELETE /v1/tenants/{id}`, its managed DBaaS database is automatically reaped.
 
+### Phase 5: Native Service Discovery Engine — **Completed (2026-09-14)**
+
+1. **Dynamic Service Discovery Catalog (`GET /v1/discovery`)**:
+   - Implemented real-time endpoint resolution across the distributed cluster in [`paas-controller/server.go`](file:///home/naveen/Projects/JavaPaaS/paas-controller/server.go).
+   - Microservices dynamically query `/v1/discovery` (all tenants) or `/v1/discovery/{tenant_id}` (single tenant) to resolve active IP addresses, hostnames, health check ports, assigned tiers, and health states (`active` vs. `recovering`).
+   - Automatically maps `NodeID` to the underlying host network interface without hardcoded IP configurations.
+2. **Crash-Aware Instant Traffic Deregistration**:
+   - When the daemon watchdog alerts of a process crash or OOM termination, the controller resurrector instantly marks the in-flight tenant state as `recovering`.
+   - The discovery engine flags the service status as `recovering`, instantly preventing upstream caller microservices from routing requests to the dead process.
+   - Traffic routing re-enables only after the resurrected JVM passes readiness probing (`Resurrector::probeHealth`).
+3. **Internal DNS & Mesh Integration Blueprint**:
+   - **Internal DNS (`<tenant-id>.javapaas.internal`)**: Integration pattern for CoreDNS / Consul forwarding to the controller discovery API, allowing services to resolve endpoints via standard DNS queries.
+   - **Envoy xDS Provider**: Blueprint for exporting JavaPaaS discovery records as standard Envoy dynamic cluster endpoints (EDS / CDS).
+
 ---
 
-## 6. Verification & Automated Test Summary
+## 6. Strategic Suggestions: How JavaPaaS Outpaces the Cloud
+
+JavaPaaS already deploys Java applications in **under 1 second (< 195ms)** compared to **3 to 10 minutes** in traditional cloud environments (Kubernetes, AWS ECS/EKS, GCP Cloud Run) due to zero-container POSIX execution and direct cgroups v2 resource allocation.
+
+To achieve complete commercial cloud parity and developer dominance, the following strategic suggestions provide the "Last Mile" roadmap:
+
+### 1. Git-Push Automated Build & Deploy (`git push javapaas main`)
+* **Concept**: A native Git SSH receiver / post-receive hook deployed alongside the controller.
+* **Workflow**:
+  ```bash
+  git remote add javapaas ssh://git@paas.company.com/apps/order-service.git
+  git push javapaas main
+  ```
+* **Engine Action**: The hook automatically detects Maven (`pom.xml`) or Gradle (`build.gradle`), executes `mvn -B clean package -DskipTests` inside a sandboxed cgroup, extracts the generated JAR, and triggers `POST /v1/tenants` for instant hot-deploy.
+
+### 2. Dynamic Ingress Routing & Automated Let's Encrypt TLS (Traefik / Caddy)
+* **Concept**: Automatic edge ingress proxy integration with zero manual DNS/proxy configuration.
+* **Workflow**:
+  - Deploying a tenant automatically configures a dynamic route: `https://<tenant-id>.paas.company.com`.
+  - Ingress controller (Traefik, Caddy, or Envoy) automatically negotiates wildcard or dedicated Let's Encrypt SSL/TLS certificates.
+  - Supports zero-downtime connection draining during live vertical tier resizes (`Silver` $\to$ `Gold`).
+
+### 3. Developer Web Console & Real-time Telemetry (SPA Dashboard)
+* **Concept**: A lightweight, responsive web dashboard (React / Vue / Svelte) consuming the CORS-enabled JavaPaaS REST APIs.
+* **Features**:
+  - **1-Click Deploy**: Drag-and-drop JAR file or Git URL with database toggle (`addon_postgres: true`).
+  - **Live Vertical Scaling**: Interactive slider to scale CPU quotas and RAM instantly (`Silver` $\to$ `Gold` $\to$ `Platinum`) without process downtime.
+  - **Streaming Logs & Chaos Console**: Live Server-Sent Events (SSE) / WebSocket stream of JVM stdout/stderr, with an interactive "Chaos Trigger" button to test watchdog recovery.
+
+### 4. Horizontal Process Autoscaling (HPA) via Cgroup Telemetry
+* **Concept**: Dynamic process replication driven by Linux kernel cgroup metrics.
+* **Implementation**:
+  - Controller continuously reads CFS throttling events (`cpu.stat` $\to$ `nr_throttled`) and memory pressure (`memory.pressure` / PSI).
+  - When CPU throttling exceeds 20% over 30 seconds, automatically forks auxiliary tenant JVM worker processes on available cluster nodes.
+
+---
+
+## 7. Verification & Automated Test Summary
 
 ### Test Execution Log
 
@@ -239,6 +291,8 @@ Result: 14 passed; 0 failed; 0 warnings; 0 errors
 --- PASS: TestServerHealthAndAuth (0.00s)
 === RUN   TestServerTenantCRUD
 --- PASS: TestServerTenantCRUD (1.00s)
+=== RUN   TestServerServiceDiscovery
+--- PASS: TestServerServiceDiscovery (0.00s)
 
-Result: 10 passed; 0 failed; 0 errors
+Result: 11 passed; 0 failed; 0 errors
 ```

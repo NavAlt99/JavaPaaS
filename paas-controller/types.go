@@ -114,6 +114,17 @@ type ResizeDaemonRequest struct {
 	NewTier string `json:"new_tier"`
 }
 
+type ServiceEndpoint struct {
+	TenantID   string `json:"tenant_id"`
+	NodeID     string `json:"node_id"`
+	Host       string `json:"host"`
+	Port       int    `json:"port"`
+	URL        string `json:"url"`
+	HealthPath string `json:"health_path,omitempty"`
+	Tier       string `json:"tier"`
+	Status     string `json:"status"`
+}
+
 type ErrorResponse struct {
 	Error string `json:"error"`
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -50,6 +51,8 @@ func NewServer(resurrector *Resurrector, store AffinityStore, nodeRegistry *Node
 	s.mux.HandleFunc("GET /v1/databases", s.handleListDatabases)
 	s.mux.HandleFunc("GET /v1/databases/{id}", s.handleGetDatabase)
 	s.mux.HandleFunc("DELETE /v1/databases/{id}", s.handleDeprovisionDatabase)
+	s.mux.HandleFunc("GET /v1/discovery", s.handleListDiscovery)
+	s.mux.HandleFunc("GET /v1/discovery/{id}", s.handleGetDiscovery)
 
 	return s
 }
@@ -413,4 +416,54 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# HELP javapaas_controller_last_recovery_latency_ms Latency of most recent recovery in milliseconds\n")
 	fmt.Fprintf(w, "# TYPE javapaas_controller_last_recovery_latency_ms gauge\n")
 	fmt.Fprintf(w, "javapaas_controller_last_recovery_latency_ms %d\n", lastLatency)
+}
+
+func (s *Server) resolveTenantEndpoint(tenantID string, spec TenantSpec) ServiceEndpoint {
+	host := "127.0.0.1"
+	if daemonURL, ok := s.nodeRegistry.Get(spec.NodeID); ok && daemonURL != "" {
+		if u, err := url.Parse(daemonURL); err == nil && u.Hostname() != "" {
+			host = u.Hostname()
+		}
+	}
+
+	port := spec.HealthCheckPort
+	serviceURL := fmt.Sprintf("http://%s:%d", host, port)
+	status := "active"
+	if rStatus, ok := s.resurrector.inFlight.Load(tenantID); ok && rStatus.(bool) {
+		status = "recovering"
+	}
+
+	return ServiceEndpoint{
+		TenantID:   tenantID,
+		NodeID:     spec.NodeID,
+		Host:       host,
+		Port:       port,
+		URL:        serviceURL,
+		HealthPath: spec.HealthCheckPath,
+		Tier:       spec.Tier,
+		Status:     status,
+	}
+}
+
+func (s *Server) handleListDiscovery(w http.ResponseWriter, r *http.Request) {
+	tenants := s.store.GetAll()
+	endpoints := make([]ServiceEndpoint, 0, len(tenants))
+	for tid, spec := range tenants {
+		endpoints = append(endpoints, s.resolveTenantEndpoint(tid, spec))
+	}
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"endpoints": endpoints,
+		"count":     len(endpoints),
+	})
+}
+
+func (s *Server) handleGetDiscovery(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	spec, ok := s.store.Get(tenantID)
+	if !ok {
+		s.writeError(w, http.StatusNotFound, fmt.Sprintf("tenant %s not found in discovery catalog", tenantID))
+		return
+	}
+	endpoint := s.resolveTenantEndpoint(tenantID, spec)
+	s.writeJSON(w, http.StatusOK, endpoint)
 }
