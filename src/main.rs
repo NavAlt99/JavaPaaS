@@ -21,10 +21,12 @@ async fn main() {
         .unwrap_or_else(|_| get_hostname());
 
     let listen_addr = std::env::var("LISTEN_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:9100".to_string());
+        .unwrap_or_else(|_| "127.0.0.1:9100".to_string());
 
     let controller_url = std::env::var("CONTROLLER_URL")
-        .unwrap_or_else(|_| "http://localhost:8080".to_string());
+        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+
+    let auth_token = std::env::var("AUTH_TOKEN").ok();
 
     let cgroup_mgr = Arc::new(cgroups::CgroupManager::new());
     if let Err(e) = cgroup_mgr.init() {
@@ -38,7 +40,11 @@ async fn main() {
         cgroup_mgr.clone(),
         node_id.clone(),
         controller_url,
+        auth_token.clone(),
     ));
+
+    let rehydrated = watchdog.rehydrate_tenants().await;
+    tracing::info!("Re-hydrated {rehydrated} tenant(s) from cgroup hierarchy on startup");
 
     let wd = watchdog.clone();
     tokio::spawn(async move {
@@ -49,6 +55,7 @@ async fn main() {
         forker,
         watchdog,
         node_id,
+        auth_token,
     };
     let app = api::create_router(app_state);
 
