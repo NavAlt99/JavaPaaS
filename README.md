@@ -2,7 +2,7 @@
 
 **JavaPaaS** is a high-density, multi-tenant Platform-as-a-Service (PaaS) engine designed specifically for running, isolating, and automatically resurrecting Java Virtual Machine (JVM) microservices and applications on bare-metal and Linux hosts.
 
-It combines a low-level **Rust daemon** leveraging Linux **cgroups v2** and POSIX process controls with a **Go orchestration controller** for automated fault recovery and node affinity management.
+It combines a low-level **Rust daemon** leveraging Linux **cgroups v2** and POSIX process controls with a **Go orchestration controller** for automated fault recovery, tenant persistence, and node affinity management.
 
 ---
 
@@ -12,14 +12,15 @@ It combines a low-level **Rust daemon** leveraging Linux **cgroups v2** and POSI
 flowchart TD
     subgraph Host["Linux Host"]
         subgraph Controller["Go: paas-controller (:8080)"]
-            AffinityStore["Node Affinity Store"]
+            AffinityStore["Persistent Affinity Store (tenants.json)"]
+            TenantAPI["Tenant CRUD API (/v1/tenants)"]
             Resurrector["Resurrect Engine"]
             RecoverAPI["/v1/internal/recover"]
         end
 
         subgraph Daemon["Rust: javapaas-daemon (:9100)"]
             DaemonAPI["Axum API (/fork, /stop, /status)"]
-            Forker["POSIX JVM Forker"]
+            Forker["POSIX JVM Forker (Command pre_exec + pipe)"]
             Cgroups["cgroups v2 Manager (/sys/fs/cgroup/javapaas)"]
             Watchdog["Health Watchdog (OOM Poller + SIGCHLD)"]
         end
@@ -36,28 +37,34 @@ flowchart TD
         end
     end
 
+    TenantAPI --> AffinityStore
     DaemonAPI --> Forker
     Forker --> Cgroups
     Cgroups --> Silver
     Cgroups --> Gold
     Cgroups --> Platinum
-    Forker -.->|fork + execvp| Tenants
+    Forker -.->|spawn + pre_exec cgroup attachment| Tenants
     Tenants -->|Registered PID| Watchdog
     Watchdog -.->|Crash / OOM detected| RecoverAPI
     RecoverAPI --> Resurrector
     Resurrector --> AffinityStore
-    Resurrector -.->|POST /fork retry| DaemonAPI
+    Resurrector -.->|POST /fork retry with backoff| DaemonAPI
 ```
 
 ---
 
 ## 🌟 Key Features
 
-* **Kernel-Native Isolation with cgroups v2:** Creates isolated hierarchical control groups per tier and tenant with strict memory ceilings (`memory.max`), zero-swap enforcement (`memory.swap.max = 0`), and group OOM termination (`memory.oom.group = 1`).
-* **Direct POSIX JVM Forking:** Replaces heavy container runtimes by using direct POSIX `fork()` and `execvp()` system calls, attaching process IDs directly to `/sys/fs/cgroup/.../cgroup.procs` before executing the JVM.
+* **Kernel-Native Isolation with cgroups v2:** Creates isolated hierarchical control groups per tier and tenant before process spawn, with strict memory ceilings (`memory.max`), zero-swap enforcement (`memory.swap.max = 0`), and group OOM termination (`memory.oom.group = 1`). Subtree control is propagated through both root and tier levels.
+* **Safe JVM Forking & Error Pipes:** Spawns JVM processes using `std::process::Command` with async-signal-safe `pre_exec` cgroup attachment and automatic error pipe reporting, preventing multi-threaded allocator deadlocks and reporting setup failures directly to the caller.
 * **Multi-Tiered JVM & Garbage Collector Profiles:** Automatically assigns tuned heap allocations and modern garbage collectors (G1GC, ZGC, Generational ZGC) based on the assigned service tier.
-* **Sub-Second Auto-Resurrection:** Dual-engine watchdog combining a 1-second `memory.events` OOM poller and an asynchronous Linux `SIGCHLD` signal handler with non-blocking `waitpid(WNOHANG)`.
-* **Zero-Downtime Controller Handshake:** When a crash occurs, the watchdog immediately reports to `paas-controller`, which fetches the tenant spec from the affinity store and re-forks the tenant with exponential backoff.
+* **Crash De-duplication & Lifecycle Tracking:** Tenant status state machine (`Running`, `Recovering`, `Stopping`, `Stopped`, `Exited`) that prevents double-reporting between the periodic OOM poller and the asynchronous `SIGCHLD` handler, and suppresses spurious recovery during manual stops.
+* **Durable Tenant Specifications:** Go controller provides full tenant CRUD APIs (`/v1/tenants`) backed by atomic file-based persistence (`tenants.json`).
+* **Live Cgroup Re-Sizing:** Dynamically updates memory and CPU quotas (`PUT /resize/{id}`) on active JVMs without interrupting runtime execution.
+* **Application Readiness Probing:** Validates guest JVM health endpoints (e.g. `/health` or `/actuator/health`) before marking resurrections as healthy, with automatic rollback if probes fail.
+* **Linux Process Sandboxing:** Child processes are secured via `PR_SET_NO_NEW_PRIVS` and `PR_SET_DUMPABLE = 0`, preventing privilege escalation and ptrace memory tampering.
+* **Multi-Node Cluster Routing:** Intelligent node registry maps tenant affinity to specific bare-metal hosts across a distributed fleet.
+* **Authenticated APIs & Hardened Deployment:** Support for bearer token authorization (`AUTH_TOKEN`), localhost binding by default (`127.0.0.1`), unprivileged controller daemon execution (`User=javapaas`), and systemd security sandboxing (`NoNewPrivileges`, `ProtectSystem=strict`, `PrivateTmp`).
 
 ---
 
@@ -65,11 +72,11 @@ flowchart TD
 
 JavaPaaS defines standardized performance and memory tiers out of the box:
 
-| Tier | Heap Min (`-Xms`) | Heap Max (`-Xmx`) | Garbage Collector & Flags | cgroup `memory.max` | Swap Limit |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Silver** | `256m` | `1g` | `-XX:+UseG1GC` | **1.25 GB** (`1,342,177,280` B) | `0` (Disabled) |
-| **Gold** | `1g` | `4g` | `-XX:MaxGCPauseMillis=200 -XX:+UseZGC` | **4.25 GB** (`4,563,402,752` B) | `0` (Disabled) |
-| **Platinum**| `4g` | `32g` | `-XX:+UseZGC -XX:+ZGenerational` | **32.25 GB** (`34,628,173,824` B)| `0` (Disabled) |
+| Tier | Heap Min (`-Xms`) | Heap Max (`-Xmx`) | Garbage Collector & Flags | cgroup `memory.max` | Swap Limit | cgroup `cpu.max` |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Silver** | `256m` | `1g` | `-XX:+UseG1GC` | **1.25 GB** (`1,342,177,280` B) | `0` (Disabled) | `100000 100000` (1 Core) |
+| **Gold** | `1g` | `4g` | `-XX:MaxGCPauseMillis=200 -XX:+UseZGC` | **4.25 GB** (`4,563,402,752` B) | `0` (Disabled) | `200000 100000` (2 Cores) |
+| **Platinum**| `4g` | `32g` | `-XX:+UseZGC -XX:+ZGenerational` | **32.25 GB** (`34,628,173,824` B)| `0` (Disabled) | `400000 100000` (4 Cores) |
 
 ---
 
@@ -77,20 +84,21 @@ JavaPaaS defines standardized performance and memory tiers out of the box:
 
 ### 1. `javapaas-daemon` (Rust)
 * **Location:** `src/`
-* **Port:** `9100` (configurable via `LISTEN_ADDR`)
+* **Default Listen:** `127.0.0.1:9100` (configurable via `LISTEN_ADDR`)
 * **Responsibilities:**
-  * Initializing `/sys/fs/cgroup/javapaas` with `+cpu +memory +io` controllers.
-  * Resolving JDK binaries from `/opt/jdk/{version}/bin/java` or system PATH.
-  * Forking and executing JARs with tier-specific JVM flags.
-  * Watching child processes and cgroup OOM events to trigger recovery alerts.
+  * Initializing `/sys/fs/cgroup/javapaas` with `+cpu +memory +io` controllers across root and tier levels.
+  * Resolving JDK binaries from `/opt/jdk/{version}/bin/java`, system `$PATH`, or standard fallback directories.
+  * Creating tenant cgroups with strict memory/swap limits prior to spawning JVM processes.
+  * Watching child processes and cgroup OOM events to trigger deduplicated recovery alerts.
 
 ### 2. `paas-controller` (Go)
 * **Location:** `paas-controller/`
-* **Port:** `8080` (configurable via `-listen`)
+* **Default Listen:** `127.0.0.1:8080` (configurable via `-listen`)
 * **Responsibilities:**
-  * Serving the recovery endpoint (`POST /v1/internal/recover`).
-  * Maintaining tenant specifications and node assignments via thread-safe `NodeAffinityStore`.
+  * Managing tenant specifications and node assignments via `/v1/tenants` with durable JSON storage (`-state-file`).
+  * Serving the recovery endpoint (`POST /v1/internal/recover`) with concurrent recovery deduplication.
   * Coordinating multi-attempt (up to 3 tries) tenant resurrection through the daemon's `/fork` API.
+  * Graceful shutdown on `SIGINT`/`SIGTERM` to drain active recoveries.
 
 ---
 
@@ -99,7 +107,7 @@ JavaPaaS defines standardized performance and memory tiers out of the box:
 JavaPaaS requires a modern Linux distribution with **cgroups v2 unified hierarchy** enabled.
 
 ### 1. Kernel Parameter Optimization
-Run the setup script with root privileges to apply required memory overcommit, swappiness, and PID limits:
+Run the setup script with root privileges:
 
 ```bash
 sudo ./scripts/setup-kernel.sh
@@ -127,7 +135,7 @@ stat -fc %T /sys/fs/cgroup/
 * **Rust:** 1.75+ (`cargo`)
 * **Go:** 1.22+ (`go`)
 * **Java:** JDK 17, 21, etc. installed at `/opt/jdk/<version>/bin/java` or available in `$PATH`.
-* **Root Privileges:** Required for cgroup management and process signals.
+* **Root Privileges:** Required for daemon cgroup management.
 
 ### 1. Automated Build & Service Installation
 Run the deployment script:
@@ -137,10 +145,8 @@ sudo ./scripts/deploy.sh
 ```
 
 This builds the release binaries into `/opt/javapaas/bin/` and creates systemd unit files:
-* `/opt/javapaas/bin/javapaas-daemon`
-* `/opt/javapaas/bin/paas-controller`
-* `/etc/systemd/system/javapaas-daemon.service`
-* `/etc/systemd/system/javapaas-controller.service`
+* `/opt/javapaas/bin/javapaas-daemon` (runs as root with `ProtectSystem=full`)
+* `/opt/javapaas/bin/paas-controller` (runs as dedicated unprivileged `javapaas` user)
 
 ### 2. Start Services via Systemd
 ```bash
@@ -151,31 +157,12 @@ sudo systemctl enable --now javapaas-daemon javapaas-controller
 ### 3. Verify Health
 ```bash
 # Check Daemon
-curl http://localhost:9100/health
-# {"status":"ok"}
+curl http://127.0.0.1:9100/health
+# {"status":"ok","node_id":"node-1"}
 
 # Check Controller
-curl http://localhost:8080/health
+curl http://127.0.0.1:8080/health
 # {"status":"ok"}
-```
-
----
-
-## 🛠️ Manual / Development Run
-
-If running locally for testing or development:
-
-```bash
-# Terminal 1: Run Controller (Go)
-cd paas-controller
-go run . -listen :8080 -daemon-url http://localhost:9100
-
-# Terminal 2: Run Daemon (Rust with root permissions for cgroups)
-sudo RUST_LOG=info \
-     NODE_ID=node-1 \
-     LISTEN_ADDR=0.0.0.0:9100 \
-     CONTROLLER_URL=http://localhost:8080 \
-     cargo run
 ```
 
 ---
@@ -183,6 +170,8 @@ sudo RUST_LOG=info \
 ## 📡 API Reference
 
 ### Rust Daemon (`:9100`)
+
+Optional authentication: pass `Authorization: Bearer <AUTH_TOKEN>` or header `X-JavaPaaS-Token: <AUTH_TOKEN>`.
 
 #### 1. Fork Tenant JVM
 * **Endpoint:** `POST /fork`
@@ -192,7 +181,7 @@ sudo RUST_LOG=info \
     "tenant_id": "tenant-alpha",
     "tier": "gold",
     "java_version": "21",
-    "jar_path": "/var/apps/service.jar",
+    "jar_path": "/opt/apps/service.jar",
     "extra_args": ["--server.port=8081"]
   }
   ```
@@ -204,10 +193,16 @@ sudo RUST_LOG=info \
     "status": "running"
   }
   ```
+* **Errors:**
+  * `400 Bad Request`: Validation failure (empty/invalid tenant ID, invalid tier, invalid jar path).
+  * `401 Unauthorized`: Missing or incorrect bearer token.
+  * `404 Not Found`: JAR file or JDK binary not found.
+  * `409 Conflict`: Tenant is already running.
+  * `500 Internal Server Error`: System fork or cgroup creation error.
 
 #### 2. Tenant Status
 * **Endpoint:** `GET /status/{tenant_id}`
-* **Response:**
+* **Response (200 OK):**
   ```json
   {
     "tenant_id": "tenant-alpha",
@@ -219,7 +214,7 @@ sudo RUST_LOG=info \
 
 #### 3. Stop Tenant
 * **Endpoint:** `POST /stop/{tenant_id}`
-* **Response:**
+* **Response (200 OK):**
   ```json
   {
     "tenant_id": "tenant-alpha",
@@ -228,11 +223,71 @@ sudo RUST_LOG=info \
   }
   ```
 
+#### 4. Live Resize Tenant
+* **Endpoint:** `PUT /resize/{tenant_id}` or `POST /resize/{tenant_id}`
+* **Request:**
+  ```json
+  {
+    "new_tier": "platinum"
+  }
+  ```
+* **Response (200 OK):**
+  ```json
+  {
+    "tenant_id": "tenant-alpha",
+    "tier": "platinum",
+    "status": "resized"
+  }
+  ```
+
+#### 5. Prometheus Metrics
+* **Endpoint:** `GET /metrics`
+* **Response (200 OK, text/plain):**
+  Exposes `javapaas_active_tenants`, `javapaas_tenant_memory_current_bytes`, `javapaas_tenant_memory_max_bytes`, `javapaas_tenant_oom_kills_total`, and `javapaas_tenant_status`.
+
 ---
 
 ### Go Controller (`:8080`)
 
-#### Recover / Resurrect Tenant (Internal)
+#### 1. Register Tenant
+* **Endpoint:** `POST /v1/tenants`
+* **Request:**
+  ```json
+  {
+    "tenant_id": "tenant-alpha",
+    "node_id": "node-1",
+    "java_version": "21",
+    "tier": "gold",
+    "jar_path": "/opt/apps/service.jar",
+    "extra_args": ["--server.port=8081"]
+  }
+  ```
+* **Response (201 Created):**
+  ```json
+  {
+    "status": "registered",
+    "tenant_id": "tenant-alpha",
+    "spec": { ... }
+  }
+  ```
+
+#### 2. List Tenants
+* **Endpoint:** `GET /v1/tenants`
+* **Response (200 OK):**
+  ```json
+  {
+    "count": 1,
+    "tenants": { ... }
+  }
+  ```
+
+#### 3. Get Tenant
+* **Endpoint:** `GET /v1/tenants/{tenant_id}`
+
+#### 4. Delete Tenant
+* **Endpoint:** `DELETE /v1/tenants/{tenant_id}`
+
+#### 5. Recover Tenant (Internal)
 * **Endpoint:** `POST /v1/internal/recover`
 * **Request (sent by Rust Watchdog):**
   ```json
@@ -242,10 +297,10 @@ sudo RUST_LOG=info \
     "node_id": "node-1",
     "reason": "OOM_KILL",
     "exit_code": null,
-    "timestamp": "2026-09-13T09:00:00Z"
+    "timestamp": "2026-09-14T12:00:00Z"
   }
   ```
-* **Response:**
+* **Response (200 OK):**
   ```json
   {
     "success": true,
@@ -254,31 +309,43 @@ sudo RUST_LOG=info \
   }
   ```
 
+#### 6. Live Resize Tenant Tier
+* **Endpoint:** `PUT /v1/tenants/{tenant_id}/resize` or `PUT /v1/tenants/{tenant_id}/tier`
+* **Request:**
+  ```json
+  {
+    "tier": "platinum"
+  }
+  ```
+
+#### 7. Cluster Node Registration
+* **Endpoint:** `POST /v1/nodes`
+* **Request:**
+  ```json
+  {
+    "node_id": "node-1",
+    "daemon_url": "http://10.0.0.1:9100"
+  }
+  ```
+* **Endpoint:** `GET /v1/nodes` (List cluster worker nodes)
+
+#### 8. Controller Prometheus Metrics
+* **Endpoint:** `GET /metrics`
+* **Response (200 OK, text/plain):**
+  Exposes `javapaas_controller_registered_tenants`, `javapaas_controller_recovery_attempts_total`, and `javapaas_controller_last_recovery_latency_ms`.
+
 ---
 
-## 📁 Repository Structure
+## 🧪 Testing
 
+### Rust Daemon Tests
+```bash
+cargo test
 ```
-├── Cargo.toml               # Rust workspace & daemon dependencies
-├── Cargo.lock
-├── src/                     # Rust Daemon Source
-│   ├── main.rs              # Daemon entry point & Tokio runtime
-│   ├── api.rs               # Axum HTTP routes (/fork, /stop, /status)
-│   ├── cgroups.rs           # cgroups v2 controller management
-│   ├── config.rs            # Tier configurations (Silver, Gold, Platinum)
-│   ├── jvm_forker.rs        # POSIX fork & execvp JVM execution
-│   ├── watchdog.rs          # OOM event poller & SIGCHLD reaper
-│   └── error.rs             # Error types
-├── paas-controller/         # Go Controller Source
-│   ├── go.mod
-│   ├── main.go              # Controller CLI entry point
-│   ├── server.go            # HTTP multiplexer & handlers
-│   ├── resurrect.go         # Automatic recovery logic with retries
-│   ├── affinity.go          # In-memory node affinity store
-│   └── types.go             # Shared event and request data types
-└── scripts/                 # Operational Scripts
-    ├── setup-kernel.sh      # sysctl kernel parameter tuning
-    └── deploy.sh            # Automated compilation & systemd unit setup
+
+### Go Controller Tests
+```bash
+cd paas-controller && go test -v ./...
 ```
 
 ---

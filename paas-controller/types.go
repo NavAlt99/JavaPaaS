@@ -1,5 +1,10 @@
 package main
 
+import (
+	"fmt"
+	"strings"
+)
+
 type TenantCrashEvent struct {
 	TenantID  string `json:"tenant_id"`
 	Tier      string `json:"tier"`
@@ -10,11 +15,59 @@ type TenantCrashEvent struct {
 }
 
 type TenantSpec struct {
-	NodeID      string   `json:"node_id"`
-	JavaVersion string   `json:"java_version"`
-	Tier        string   `json:"tier"`
-	JarPath     string   `json:"jar_path"`
-	ExtraArgs   []string `json:"extra_args"`
+	NodeID          string   `json:"node_id"`
+	JavaVersion     string   `json:"java_version"`
+	Tier            string   `json:"tier"`
+	JarPath         string   `json:"jar_path"`
+	ExtraArgs       []string `json:"extra_args"`
+	HealthCheckPath string   `json:"health_check_path,omitempty"`
+	HealthCheckPort int      `json:"health_check_port,omitempty"`
+}
+
+func (s *TenantSpec) Validate() error {
+	if strings.TrimSpace(s.NodeID) == "" {
+		return fmt.Errorf("node_id cannot be empty")
+	}
+	if strings.TrimSpace(s.JavaVersion) == "" {
+		return fmt.Errorf("java_version cannot be empty")
+	}
+	tier := strings.ToLower(strings.TrimSpace(s.Tier))
+	if tier != "silver" && tier != "gold" && tier != "platinum" {
+		return fmt.Errorf("invalid tier '%s': must be silver, gold, or platinum", s.Tier)
+	}
+	if strings.TrimSpace(s.JarPath) == "" || strings.Contains(s.JarPath, "..") || !strings.HasSuffix(s.JarPath, ".jar") {
+		return fmt.Errorf("jar_path must be non-empty, end with .jar, and not contain '..'")
+	}
+	if s.HealthCheckPort < 0 || s.HealthCheckPort > 65535 {
+		return fmt.Errorf("invalid health_check_port %d: must be between 1 and 65535", s.HealthCheckPort)
+	}
+	return nil
+}
+
+type TenantRegistrationRequest struct {
+	TenantID        string   `json:"tenant_id"`
+	NodeID          string   `json:"node_id"`
+	JavaVersion     string   `json:"java_version"`
+	Tier            string   `json:"tier"`
+	JarPath         string   `json:"jar_path"`
+	ExtraArgs       []string `json:"extra_args"`
+	HealthCheckPath string   `json:"health_check_path,omitempty"`
+	HealthCheckPort int      `json:"health_check_port,omitempty"`
+}
+
+type TenantResizeRequest struct {
+	Tier string `json:"tier"`
+}
+
+type NodeRegistrationRequest struct {
+	NodeID    string `json:"node_id"`
+	DaemonURL string `json:"daemon_url"`
+}
+
+type NodeInfo struct {
+	NodeID    string `json:"node_id"`
+	DaemonURL string `json:"daemon_url"`
+	Status    string `json:"status"`
 }
 
 type RecoveryResult struct {
@@ -36,4 +89,12 @@ type ForkResponse struct {
 	TenantID string `json:"tenant_id"`
 	PID      int    `json:"pid"`
 	Status   string `json:"status"`
+}
+
+type ResizeDaemonRequest struct {
+	NewTier string `json:"new_tier"`
+}
+
+type ErrorResponse struct {
+	Error string `json:"error"`
 }

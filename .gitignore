@@ -1,0 +1,6 @@
+target/
+*.log
+paas-controller/bin/
+paas-controller/paas-controller
+paas-controller/controller
+.env
